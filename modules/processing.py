@@ -98,7 +98,7 @@ class StableDiffusionProcessing():
     """
     The first set of paramaters: sd_models -> do_not_reload_embeddings represent the minimum required to create a StableDiffusionProcessing
     """
-    def __init__(self, sd_model=None, outpath_samples=None, outpath_grids=None, prompt: str = "", styles: List[str] = None, seed: int = -1, subseed: int = -1, subseed_strength: float = 0, seed_resize_from_h: int = -1, seed_resize_from_w: int = -1, seed_enable_extras: bool = True, sampler_name: str = None, batch_size: int = 1, n_iter: int = 1, steps: int = 50, cfg_scale: float = 7.0, width: int = 512, height: int = 512, restore_faces: bool = False, tiling: bool = False, do_not_save_samples: bool = False, do_not_save_grid: bool = False, extra_generation_params: Dict[Any, Any] = None, overlay_images: Any = None, negative_prompt: str = None, eta: float = None, do_not_reload_embeddings: bool = False, denoising_strength: float = 0, ddim_discretize: str = None, s_churn: float = 0.0, s_tmax: float = None, s_tmin: float = 0.0, s_noise: float = 1.0, override_settings: Dict[str, Any] = None, override_settings_restore_afterwards: bool = True, sampler_index: int = None):
+    def __init__(self, sd_model=None, outpath_samples=None, outpath_grids=None, prompt: str = "", styles: List[str] = None, seed: int = -1, subseed: int = -1, subseed_strength: float = 0, seed_resize_from_h: int = -1, seed_resize_from_w: int = -1, seed_enable_extras: bool = True, sampler_name: str = None, batch_size: int = 1, n_iter: int = 1, steps: int = 50, cfg_scale: float = 7.0, width: int = 512, height: int = 512, restore_faces: bool = False, tiling: bool = False, do_not_save_samples: bool = False, do_not_save_grid: bool = False, extra_generation_params: Dict[Any, Any] = None, overlay_images: Any = None, negative_prompt: str = None, eta: float = None, do_not_reload_embeddings: bool = False, denoising_strength: float = 0, ddim_discretize: str = None, s_churn: float = 0.0, s_tmax: float = None, s_tmin: float = 0.0, s_noise: float = 1.0, override_settings: Dict[str, Any] = None, override_settings_restore_afterwards: bool = True, sampler_index: int = None, script_args: list = None):
         if sampler_index is not None:
             print("sampler_index argument for StableDiffusionProcessing does not do anything; use sampler_name", file=sys.stderr)
 
@@ -149,7 +149,7 @@ class StableDiffusionProcessing():
             self.seed_resize_from_w = 0
 
         self.scripts = None
-        self.script_args = None
+        self.script_args = script_args
         self.all_prompts = None
         self.all_negative_prompts = None
         self.all_seeds = None
@@ -544,6 +544,29 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     infotexts = []
     output_images = []
 
+    cached_uc = [None, None]
+    cached_c = [None, None]
+
+    def get_conds_with_caching(function, required_prompts, steps, cache):
+        """
+        Returns the result of calling function(shared.sd_model, required_prompts, steps)
+        using a cache to store the result if the same arguments have been used before.
+
+        cache is an array containing two elements. The first element is a tuple
+        representing the previously used arguments, or None if no arguments
+        have been used before. The second element is where the previously
+        computed result is stored.
+        """
+
+        if cache[0] is not None and (required_prompts, steps) == cache[0]:
+            return cache[1]
+
+        with devices.autocast():
+            cache[1] = function(shared.sd_model, required_prompts, steps)
+
+        cache[0] = (required_prompts, steps)
+        return cache[1]
+
     with torch.no_grad(), p.sd_model.ema_scope():
         with devices.autocast():
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
@@ -571,9 +594,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if p.scripts is not None:
                 p.scripts.process_batch(p, batch_number=n, prompts=prompts, seeds=seeds, subseeds=subseeds)
 
-            with devices.autocast():
-                uc = prompt_parser.get_learned_conditioning(shared.sd_model, negative_prompts, p.steps)
-                c = prompt_parser.get_multicond_learned_conditioning(shared.sd_model, prompts, p.steps)
+            uc = get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, p.steps, cached_uc)
+            c = get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, prompts, p.steps, cached_c)
 
             if len(model_hijack.comments) > 0:
                 for comment in model_hijack.comments:
@@ -665,6 +687,18 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     return res
 
 
+def old_hires_fix_first_pass_dimensions(width, height):
+    """old algorithm for auto-calculating first pass size"""
+
+    desired_pixel_count = 512 * 512
+    actual_pixel_count = width * height
+    scale = math.sqrt(desired_pixel_count / actual_pixel_count)
+    width = math.ceil(scale * width / 64) * 64
+    height = math.ceil(scale * height / 64) * 64
+
+    return width, height
+
+
 class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
     sampler = None
 
@@ -681,17 +715,26 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.hr_upscale_to_y = hr_resize_y
 
         if firstphase_width != 0 or firstphase_height != 0:
-            print("firstphase_width/firstphase_height no longer supported; use hr_scale", file=sys.stderr)
-            self.hr_scale = self.width / firstphase_width
+            self.hr_upscale_to_x = self.width
+            self.hr_upscale_to_y = self.height
             self.width = firstphase_width
             self.height = firstphase_height
 
         self.truncate_x = 0
         self.truncate_y = 0
-
+        self.applied_old_hires_behavior_to = None
 
     def init(self, all_prompts, all_seeds, all_subseeds):
         if self.enable_hr:
+            if opts.use_old_hires_fix_width_height and self.applied_old_hires_behavior_to != (self.width, self.height):
+                self.hr_resize_x = self.width
+                self.hr_resize_y = self.height
+                self.hr_upscale_to_x = self.width
+                self.hr_upscale_to_y = self.height
+
+                self.width, self.height = old_hires_fix_first_pass_dimensions(self.width, self.height)
+                self.applied_old_hires_behavior_to = (self.width, self.height)
+
             if self.hr_resize_x == 0 and self.hr_resize_y == 0:
                 self.extra_generation_params["Hires upscale"] = self.hr_scale
                 self.hr_upscale_to_x = int(self.width * self.hr_scale)
